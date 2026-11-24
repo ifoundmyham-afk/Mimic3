@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Mimic</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<style>
+:root{--bg:#0b0b0d;--fg:#d9d9de;--dim:#7c7c86;--card:#17171b;--acc:#e0323c;color-scheme:dark;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:light){:root:not([data-theme="dark"]){--bg:#ececef;--fg:#1b1b1f;--dim:#666670;--card:#fff;color-scheme:light}}
+:root[data-theme="dark"]{--bg:#0b0b0d;--fg:#d9d9de}
+*{box-sizing:border-box}html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:space-between;padding:20px;text-align:center}
+h1{font-size:14px;letter-spacing:.4em;text-transform:uppercase;margin:0;color:var(--dim)}
+#stage{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:28px}
+#eye{width:130px;height:130px;border-radius:50%;background:radial-gradient(circle at 50% 50%,#000 0 18%,#8a1d24 19% 45%,#220508 70%);box-shadow:0 0 30px #e0323c33;opacity:.35;transition:opacity .6s,box-shadow .2s}
+#eye.on{opacity:1}#eye.talk{box-shadow:0 0 80px #e0323ccc}
+#mood{font-size:18px;min-height:1.4em}#sub{color:var(--dim);font-size:13px;min-height:1.2em}
+.bar{width:220px;height:4px;background:var(--card);border-radius:2px;overflow:hidden}.bar i{display:block;height:100%;width:0;background:var(--acc);transition:width .6s}
+.row{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;width:100%;max-width:420px}
+button{flex:1;min-width:120px;padding:14px;border:0;border-radius:12px;background:var(--card);color:var(--fg);font-size:15px}
+button.main{background:var(--acc);color:#fff}button:active{opacity:.7}
+small{color:var(--dim);font-size:11px;margin-top:10px;max-width:340px}
+</style></head><body>
+<h1>Mimic</h1>
+<div id="stage">
+<div id="eye"></div>
+<div><div id="mood">Asleep</div><div id="sub">Tap wake and let it listen.</div></div>
+<div class="bar"><i id="fam"></i></div>
+</div>
+<div class="row">
+<button class="main" id="wake">Wake</button>
+<button id="mode">Mode: Subtle</button>
+<button id="call">Make it speak</button>
+<button id="forget">Forget all</button>
+<small>Everything stays on your device. Keep this page open and the screen on. Use speakers, not headphones, to hear it.</small>
+</div>
+<script>
+// ---- BRAIN: knows nothing about phones. Body supplies listen/speak. ----
+const Brain={
+  clips:[],heard:0,mode:'subtle',
+  familiarity(){return Math.min(1,this.heard/40)},
+  learn(c){this.clips.push(c);this.heard++;if(this.clips.length>60){this.clips.sort((a,b)=>b.plays-a.plays||a.t-b.t);this.clips.shift()}},
+  pick(){ // favor clips it hasn't replayed, and sometimes the newest
+    if(!this.clips.length)return null;
+    if(Math.random()<.3)return this.clips[this.clips.length-1];
+    const w=this.clips.map(c=>1/(1+c.plays));let r=Math.random()*w.reduce((a,b)=>a+b,0);
+    for(let i=0;i<w.length;i++){r-=w[i];if(r<=0)return this.clips[i]}return this.clips[0]},
+  delay(){const f=this.familiarity();const [lo,hi]=this.mode==='bold'?[8,25]:[60,180];
+    return (lo+Math.random()*(hi-lo))*(1-.6*f)*1000},
+  style(){const f=this.familiarity();return{rate:1+(Math.random()-.5)*(.1+.3*f),volume:.35+.65*f}},
+  mood(){const f=this.familiarity();return f<.1?'Curious…':f<.4?'Learning your voice':f<.8?'Familiar':'It knows you'}
+};
+// ---- BODY: phone mic + speaker. Swap this for a robot later. ----
+const $=id=>document.getElementById(id);
+let db=null,ctx,an,stream,rec,buf,awake=false,speaking=false,recording=false,floor=.01,silentSince=0,startedAt=0,chunks=[],timer=null,lock=null;
+function openDB(){return new Promise(res=>{try{const r=indexedDB.open('mimic',1);r.onupgradeneeded=()=>r.result.createObjectStore('c',{keyPath:'id'});r.onsuccess=()=>res(r.result);r.onerror=()=>res(null)}catch(e){res(null)}})}
+const store=(m)=>db.transaction('c',m).objectStore('c');
+const dbAll=()=>new Promise(r=>{if(!db)return r([]);const q=store('readonly').getAll();q.onsuccess=()=>r(q.result);q.onerror=()=>r([])});
+const dbPut=c=>new Promise(r=>{if(!db)return r();const q=store('readwrite').put(c);q.onsuccess=q.onerror=()=>r()});
+const dbClear=()=>new Promise(r=>{if(!db)return r();const q=store('readwrite').clear();q.onsuccess=q.onerror=()=>r()});
+function saveStats(){try{localStorage.setItem('mimic',JSON.stringify({heard:Brain.heard,mode:Brain.mode}))}catch(e){}}
+function ui(sub){$('mood').textContent=awake?Brain.mood():'Asleep';if(sub)$('sub').textContent=sub;$('fam').style.width=Brain.familiarity()*100+'%';$('mode').textContent='Mode: '+(Brain.mode==='bold'?'Bold':'Subtle')}
+async function wake(){
+  ui('Asking for microphone…');
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:false}});
+  }catch(e){ui('Mic error: '+(e&&e.name||'unknown')+(window.isSecureContext?'':' (page not secure)')+(window.top!==window?' (inside a frame)':''));return}
+  try{
+  ctx=new(window.AudioContext||window.webkitAudioContext)();if(ctx.state==='suspended')await ctx.resume();an=ctx.createAnalyser();an.fftSize=1024;
+  ctx.createMediaStreamSource(stream).connect(an);buf=new Uint8Array(an.fftSize);
+  awake=true;$('eye').classList.add('on');$('wake').textContent='Sleep';ui('Listening…');
+  try{lock=await navigator.wakeLock.request('screen')}catch(e){}
+  loop();schedule();
+  }catch(e){awake=false;ui('Start error: '+(e&&e.name||'')+' '+(e&&e.message||''))}
+}
+function sleep(){
+  awake=false;clearTimeout(timer);try{stream.getTracks().forEach(t=>t.stop());ctx.close();lock&&lock.release()}catch(e){}
+  $('eye').classList.remove('on');$('wake').textContent='Wake';ui('Asleep. It remembers.');
+}
+function loop(){
+  if(!awake)return;requestAnimationFrame(loop);
+  an.getByteTimeDomainData(buf);let s=0;for(const v of buf){const d=(v-128)/128;s+=d*d}const lvl=Math.sqrt(s/buf.length);
+  $('eye').style.transform='scale('+(1+Math.min(lvl*4,.4))+')';
+  if(speaking)return;
+  const th=Math.max(.04,floor*3),now=performance.now();
+  if(!recording){floor=floor*.98+lvl*.02;if(lvl>th)startRec(now)}
+  else{if(lvl>th)silentSince=now;
+    if(now-silentSince>800||now-startedAt>6000)stopRec(now)}
+}
+function startRec(now){
+  try{rec=new MediaRecorder(stream)}catch(e){return}
+  chunks=[];rec.ondataavailable=e=>e.data.size&&chunks.push(e.data);
+  rec.onstop=async()=>{
+    const dur=(performance.now()-startedAt)/1000;if(dur<.5||!chunks.length)return;
+    const c={id:Date.now()+''+Math.random(),t:Date.now(),plays:0,blob:new Blob(chunks,{type:rec.mimeType})};
+    Brain.learn(c);await dbPut(c);saveStats();ui('It heard you.');
+  };
+  rec.start();recording=true;startedAt=silentSince=now;
+}
+function stopRec(){recording=false;try{rec.stop()}catch(e){}}
+function mimic(){
+  const c=Brain.pick();if(!c||!awake){schedule();return}
+  if(recording)stopRec();
+  const a=new Audio(URL.createObjectURL(c.blob)),st=Brain.style();
+  a.playbackRate=st.rate;a.volume=st.volume;a.preservesPitch=false;a.webkitPreservesPitch=false;
+  speaking=true;$('eye').classList.add('talk');c.plays++;dbPut(c);
+  const done=()=>{speaking=false;$('eye').classList.remove('talk');floor=.01;URL.revokeObjectURL(a.src);schedule()};
+  a.onended=a.onerror=done;a.play().catch(done);
+}
+function schedule(){clearTimeout(timer);if(awake)timer=setTimeout(mimic,Brain.delay())}
+$('wake').onclick=()=>awake?sleep():wake();
+$('mode').onclick=()=>{Brain.mode=Brain.mode==='bold'?'subtle':'bold';saveStats();ui();schedule()};
+$('call').onclick=()=>{if(!awake)return ui('Wake it first.');if(!Brain.clips.length)return ui('It has not heard anything yet.');clearTimeout(timer);mimic()};
+$('forget').onclick=async()=>{if(!confirm('Erase everything it has learned?'))return;Brain.clips=[];Brain.heard=0;await dbClear();saveStats();ui('Memory wiped.')};
+(async()=>{
+  try{const s=JSON.parse(localStorage.getItem('mimic')||'{}');Brain.heard=s.heard||0;Brain.mode=s.mode||'subtle'}catch(e){}
+  db=await openDB();Brain.clips=await dbAll();Brain.heard=Math.max(Brain.heard,Brain.clips.length);ui(Brain.clips.length?'It remembers '+Brain.clips.length+' sounds.':undefined);
+})();
+</script></body></html>
